@@ -1,6 +1,8 @@
 local ipset = require "resty.ipset"
 
-local _M = {}
+local _M = {
+    _VERSION = "1.0.0",
+}
 local instance = nil
 local init_err = nil
 
