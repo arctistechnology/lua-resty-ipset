@@ -1,8 +1,15 @@
 # lua-resty-ipset
 
-High-performance Lua/LuaJIT bindings for Linux [ipset](https://ipset.netfilter.org/)
-via `libipset` FFI. Zero subprocess overhead, kernel-level IP filtering for
-OpenResty / nginx.
+LuaJIT FFI bindings for `libipset`, exposing the Linux kernel's ipset
+machinery to OpenResty and nginx as a regular Lua API.
+
+The library opens a netlink session against `nfnetlink_ipset` and issues
+commands directly, with no `popen` / `os.execute` / fork-exec round trip
+per call. Set operations are submitted as netlink messages, results are
+parsed in-process, and output for `list` / `save` is captured through a
+custom `ipset_print_outfn` callback rather than a temporary file. Each
+ban, unban, or membership test resolves in tens of microseconds and
+never yields the worker.
 
 ## Synopsis
 
@@ -45,29 +52,68 @@ http {
 
 ## Installation
 
+Install the Lua module:
+
 ```bash
 luarocks install lua-resty-ipset
 ```
 
-### System requirements
+Install the system dependencies (Ubuntu / Debian):
 
-- LuaJIT (or Lua 5.1+ with FFI)
-- `libipset` (libipset.so.13 or compatible)
-- Linux kernel with `ip_set` module
-- The nginx worker process must have `CAP_NET_ADMIN`. If nginx runs as root
-  this is satisfied automatically. For non-root setups, grant the capability
-  via systemd:
+```bash
+sudo apt install ipset libipset-dev iptables-persistent
+```
 
-  ```ini
-  [Service]
-  AmbientCapabilities=CAP_NET_ADMIN
-  ```
+Create the kernel set:
 
-  or directly on the binary:
+```bash
+sudo ipset create banlist hash:ip family inet \
+    timeout 3600 maxelem 1000000 hashsize 4096 -exist
+```
 
-  ```bash
-  sudo setcap cap_net_admin+ep /path/to/nginx
-  ```
+Wire it into iptables so banned packets are dropped before reaching nginx:
+
+```bash
+sudo iptables -I INPUT -m set --match-set banlist src -j DROP
+sudo netfilter-persistent save
+```
+
+Persist ipset across reboots:
+
+```bash
+sudo ipset save > /etc/ipset.conf
+sudo systemctl enable ipset.service
+echo "*/15 * * * * root /usr/sbin/ipset save > /etc/ipset.conf" | \
+    sudo tee /etc/cron.d/ipset-save
+```
+
+The nginx worker process needs `CAP_NET_ADMIN` to talk to the kernel via
+netlink. If nginx runs as root this is satisfied automatically. If it
+runs as a non-root user, grant the capability through systemd:
+
+```bash
+sudo systemctl edit nginx.service
+```
+
+Add the following lines in the editor, then save:
+
+```ini
+[Service]
+AmbientCapabilities=CAP_NET_ADMIN
+```
+
+Reload and restart:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart nginx
+```
+
+Or apply the capability directly to the binary:
+
+```bash
+sudo setcap cap_net_admin+ep /usr/sbin/nginx
+```
 
 ## Methods
 
@@ -89,8 +135,8 @@ Creates a new ipset session bound to `setname`.
 
 Returns the instance on success, or `nil` and an error string.
 
-> Do not call `new()` inside `init_by_lua`. Netlink sockets do not survive the
-> master → worker fork. Use `init_worker_by_lua` or any later phase.
+> Do not call `new()` inside `init_by_lua`. Netlink sockets do not survive
+> the master → worker fork. Use `init_worker_by_lua` or any later phase.
 
 ### bl:ban(ip, timeout?)
 
@@ -109,14 +155,15 @@ Removes `ip` from the set. Returns `true` on success.
 
 `syntax: banned, err = bl:is_banned(ip)`
 
-Returns `true` if `ip` is in the set, `false` if not, or `nil` and an error
-string on failure.
+Returns `true` if `ip` is in the set, `false` if not, or `nil` and an
+error string on failure.
 
 ### bl:ban_many(ips, timeout?)
 
 `syntax: results = bl:ban_many(ips, timeout?)`
 
-Bans an array of IPs. Returns a table `{ ok = N, failed = N, errors = {...} }`.
+Bans an array of IPs. Returns a table
+`{ ok = N, failed = N, errors = {...} }`.
 
 ### bl:unban_many(ips)
 
@@ -162,27 +209,13 @@ Destroys the set. Fails if the set is referenced by iptables/nftables.
 Releases the netlink socket. Idempotent. The instance becomes unusable
 afterwards.
 
-## Performance
-
-Measured on a single OpenResty worker, 10,000 sequential operations against a
-fresh `hash:ip` set:
-
-| Operation  | Throughput      | Latency      |
-|------------|-----------------|--------------|
-| `ban`      | ~60,000 ops/sec | ~16 µs/op    |
-| `is_banned`| ~80,000 ops/sec | ~12 µs/op    |
-| `unban`    | ~80,000 ops/sec | ~12 µs/op    |
-| `list`     | 10,000 entries  | ~13 ms total |
-
-All operations are non-blocking from nginx's point of view. No subprocess,
-no temporary files, no disk I/O.
-
 ## Submodules
 
 ### resty.ipset.banlist
 
-A singleton wrapper around a default `banlist` set. Designed for OpenResty
-worker initialization:
+A singleton wrapper around a default `banlist` set. Designed for
+OpenResty worker initialization — creates one ipset instance per worker
+on startup, then reused by every request.
 
 ```lua
 -- nginx.conf
@@ -191,13 +224,28 @@ init_worker_by_lua_block {
     banlist.init()
 }
 
--- anywhere
+-- in any request handler
 local bl = require("resty.ipset.banlist").get()
 bl:ban("203.0.113.42")
 ```
 
 `banlist.init()` creates the instance once per worker. `banlist.get()`
-returns the cached instance.
+returns the cached instance, or `nil` plus an error if init failed.
+
+## Performance
+
+Measured on a single OpenResty worker, 10,000 sequential operations
+against a fresh `hash:ip` set:
+
+| Operation  | Throughput      | Latency      |
+|------------|-----------------|--------------|
+| `ban`      | ~60,000 ops/sec | ~16 µs/op    |
+| `is_banned`| ~80,000 ops/sec | ~12 µs/op    |
+| `unban`    | ~83,000 ops/sec | ~12 µs/op    |
+| `list`     | 10,000 entries  | ~13 ms total |
+
+All operations are non-blocking from nginx's point of view. No subprocess,
+no temporary files, no disk I/O.
 
 ## License
 
